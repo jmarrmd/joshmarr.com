@@ -118,9 +118,6 @@ body::before {
   fill: currentColor;
 }
 
-/* University of Utah crimson for the block-U mark */
-.link .uofu { fill: #cc0000; }
-
 .link span { flex: 1; text-align: left; }
 
 .footer {
