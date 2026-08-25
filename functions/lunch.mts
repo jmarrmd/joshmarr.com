@@ -1,64 +1,87 @@
 /**
  * Live iCalendar feed for schoolnutritionandfitness.com WebMenus.
  *
- * The vendor has no iCal export, but its public GraphQL API returns
- * structured per-day menu items. This walks the published-month chain
- * and emits one all-day event per school day.
+ * Anchored on the MENU TYPE id, which is stable across school years, and
+ * resolves each calendar month directly via menuType.menu(month, year).
+ * Nothing is pinned to a particular month, so this does not expire.
  *
  * Served at:  https://www.joshmarr.com/lunch.ics
- * Options:    ?id=<menuId>   start menu (defaults to DEFAULT_MENU_ID)
- *             ?name=<label>  calendar display name
- *             ?months=<n>    how many months forward to walk (1-12)
+ * Options:    ?type=<menuTypeId>  menu type (defaults to DEFAULT_MENU_TYPE)
+ *             ?name=<label>       calendar display name
+ *             ?back=<n>           months of history to keep (0-6, default 1)
+ *             ?ahead=<n>          months to look ahead (1-6, default 3)
  */
 
 const GQL = "https://api.schoolnutritionandfitness.com/graphql";
 
-// Elementary Lunch Menu, siteCode 3397
-const DEFAULT_MENU_ID = "6a7e1eebb7679f386e68a398";
+// "Elementary Lunch Menu" — stable across school years.
+const DEFAULT_MENU_TYPE = "58485a30eabc88213e8b4567";
 
 const CATEGORY_ORDER = ["Entrees", "Sides", "Condiment", "Ancillary"];
 
-const QUERY = (id) => `
+// The API uses 0-indexed months (0 = January).
+const monthQuery = (typeId, month, year) => `
 {
-  menu(id: "${id}") {
-    id month year
-    menuType { id name }
-    items { day month year hidden product { id name category } }
-    nextMonthPublished { id }
+  menuType(id: "${typeId}") {
+    id
+    name
+    menu(month: ${month}, year: ${year}) {
+      id month year
+      items { day month year hidden product { id name category } }
+    }
   }
 }`;
 
-async function fetchMenu(id) {
+async function gql(query) {
   const res = await fetch(GQL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "joshmarr-lunch-ics/1.0",
+      "User-Agent": "joshmarr-lunch-ics/2.0",
     },
-    body: JSON.stringify({ query: QUERY(id) }),
+    body: JSON.stringify({ query }),
   });
   if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}`);
   const json = await res.json();
   if (json.errors) throw new Error(JSON.stringify(json.errors).slice(0, 300));
-  return json.data?.menu ?? null;
+  return json.data;
 }
 
-/** Follow nextMonthPublished so the feed keeps rolling into new months. */
-async function fetchChain(startId, maxMonths) {
-  const menus = [];
-  const seen = new Set();
-  let id = startId;
-  while (id && !seen.has(id) && menus.length < maxMonths) {
-    const menu = await fetchMenu(id);
-    if (!menu) break;
-    seen.add(menu.id);
-    menus.push(menu);
-    id = menu.nextMonthPublished?.id ?? null;
+/**
+ * Resolve a window of months around today. Unpublished months come back
+ * null and are simply skipped, so a gap (summer break) is not an error.
+ */
+async function fetchWindow(typeId, back, ahead) {
+  const now = new Date();
+  const targets = [];
+  for (let offset = -back; offset <= ahead; offset++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + offset, 1));
+    targets.push({ month: d.getUTCMonth(), year: d.getUTCFullYear() });
   }
-  return menus;
+
+  // Resolved in parallel — each is an independent lookup.
+  const results = await Promise.all(
+    targets.map(async (t) => {
+      try {
+        const data = await gql(monthQuery(typeId, t.month, t.year));
+        return data?.menuType ?? null;
+      } catch {
+        return null; // one bad month must not sink the whole feed
+      }
+    })
+  );
+
+  const menus = [];
+  let typeName = null;
+  for (const mt of results) {
+    if (!mt) continue;
+    typeName ??= mt.name;
+    if (mt.menu) menus.push(mt.menu);
+  }
+  return { menus, typeName };
 }
 
-/** Group visible items into { "YYYYMMDD": { category: [names] } }. */
+/** Group visible items by calendar date. */
 function daysFrom(menu) {
   const out = new Map();
   for (const item of menu.items ?? []) {
@@ -66,7 +89,6 @@ function daysFrom(menu) {
     const name = (item.product?.name ?? "").trim();
     if (!name || !item.day) continue;
 
-    // API months are 0-indexed; item values override the menu's.
     const mo = item.month ?? menu.month;
     const yr = item.year ?? menu.year;
     const d = new Date(Date.UTC(yr, mo, item.day));
@@ -94,7 +116,6 @@ function fold(line) {
   while (i < bytes.length) {
     const take = parts.length === 0 ? 75 : 74;
     let chunk = bytes.subarray(i, i + take);
-    // never split a multi-byte character
     while (chunk.length && (chunk[chunk.length - 1] & 0xc0) === 0x80) {
       chunk = chunk.subarray(0, chunk.length - 1);
     }
@@ -108,8 +129,7 @@ const nextDay = (yyyymmdd) => {
   const y = +yyyymmdd.slice(0, 4);
   const m = +yyyymmdd.slice(4, 6) - 1;
   const d = +yyyymmdd.slice(6, 8);
-  const t = new Date(Date.UTC(y, m, d + 1));
-  return t.toISOString().slice(0, 10).replace(/-/g, "");
+  return new Date(Date.UTC(y, m, d + 1)).toISOString().slice(0, 10).replace(/-/g, "");
 };
 
 function buildIcs(menus, calName) {
@@ -125,10 +145,15 @@ function buildIcs(menus, calName) {
     "REFRESH-INTERVAL;VALUE=DURATION:PT12H",
   ];
 
+  const seen = new Set();
   let count = 0;
+
   for (const menu of menus) {
     const days = [...daysFrom(menu).entries()].sort((a, b) => a[0].localeCompare(b[0]));
     for (const [date, cats] of days) {
+      if (seen.has(date)) continue; // guard against overlapping months
+      seen.add(date);
+
       const entrees = cats.get("Entrees") ?? [];
       let title = entrees.length
         ? entrees.join(" / ")
@@ -143,7 +168,7 @@ function buildIcs(menus, calName) {
 
       lines.push(
         "BEGIN:VEVENT",
-        `UID:${menu.id}-${date}@joshmarr.com`,
+        `UID:lunch-${date}@joshmarr.com`,
         `DTSTAMP:${stamp}`,
         `DTSTART;VALUE=DATE:${date}`,
         `DTEND;VALUE=DATE:${nextDay(date)}`,
@@ -160,31 +185,34 @@ function buildIcs(menus, calName) {
   return { ics: lines.join("\r\n") + "\r\n", count };
 }
 
+const clamp = (v, lo, hi, dflt) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : dflt;
+};
+
 export default async (req) => {
   const url = new URL(req.url);
-  const id = url.searchParams.get("id") || DEFAULT_MENU_ID;
-  const months = Math.min(Math.max(Number(url.searchParams.get("months")) || 12, 1), 12);
+  const typeId = url.searchParams.get("type") || DEFAULT_MENU_TYPE;
+  const back = clamp(url.searchParams.get("back"), 0, 6, 1);
+  const ahead = clamp(url.searchParams.get("ahead"), 1, 6, 3);
 
-  if (!/^[a-f0-9]{24}$/i.test(id)) {
-    return new Response("Invalid menu id.\n", { status: 400 });
+  if (!/^[a-f0-9]{24}$/i.test(typeId)) {
+    return new Response("Invalid menu type id.\n", { status: 400 });
   }
 
   try {
-    const menus = await fetchChain(id, months);
-    if (!menus.length) return new Response("Menu not found.\n", { status: 404 });
-
-    const calName =
-      url.searchParams.get("name") || menus[0].menuType?.name || "School Lunch";
+    const { menus, typeName } = await fetchWindow(typeId, back, ahead);
+    const calName = url.searchParams.get("name") || typeName || "School Lunch";
     const { ics, count } = buildIcs(menus, calName);
 
+    // An empty calendar is valid (summer break) — still serve 200 so
+    // subscribed clients don't drop the feed.
     return new Response(ics, {
       status: 200,
       headers: {
         "Content-Type": "text/calendar; charset=utf-8",
         "Content-Disposition": 'inline; filename="lunch.ics"',
-        // Browser/client cache
         "Cache-Control": "public, max-age=3600",
-        // Netlify CDN: serve fast, refresh in the background
         "Netlify-CDN-Cache-Control":
           "public, durable, max-age=21600, stale-while-revalidate=86400",
         "X-Menu-Days": String(count),
