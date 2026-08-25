@@ -7,7 +7,7 @@
 
 # Serverless functions
 [functions]
-  directory = "netlify/functions"
+  directory = "functions"
   node_bundler = "esbuild"
 
 # Security + caching headers
