@@ -29,15 +29,6 @@
   [headers.values]
     Cache-Control = "public, max-age=86400"
 
-# Lunch menu calendar feed.
-# MUST stay above the catch-all 404 rule below — redirects are evaluated
-# top-down, and the catch-all would otherwise swallow this path.
-[[redirects]]
-  from = "/lunch.ics"
-  to = "/.netlify/functions/lunch"
-  status = 200
-  force = true
-
 # Send any unknown path to the custom 404 page
 [[redirects]]
   from = "/*"
